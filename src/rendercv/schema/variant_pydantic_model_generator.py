@@ -29,13 +29,40 @@ def sanitize_defaults(value: Any) -> Any:
     return value
 
 
+def resolve_nested_model(field_info: FieldInfo) -> pydantic.BaseModel | None:
+    """Resolve a FieldInfo's default to a Pydantic model instance.
+
+    Why:
+        Multiple functions need to inspect whether a field's default is a nested
+        Pydantic model. The default can come from either a direct value or a
+        factory callable. This helper encapsulates the resolution and isinstance
+        check, eliminating repeated cast() calls across the module.
+
+    Args:
+        field_info: Pydantic field info to inspect.
+
+    Returns:
+        Model instance if the default is a BaseModel, otherwise None.
+    """
+    if field_info.default_factory is not None:
+        factory = cast(Callable[[], Any], field_info.default_factory)
+        obj = factory()
+        if isinstance(obj, pydantic.BaseModel):
+            return obj
+    elif isinstance(field_info.default, pydantic.BaseModel):
+        return field_info.default
+    return None
+
+
 def create_variant_pydantic_model[T: pydantic.BaseModel](
+    *,
     variant_name: str,
     defaults: dict[str, Any],
     base_class: type[T],
     discriminator_field: str,
     class_name_suffix: str,
     module_name: str,
+    require_all_fields: bool = False,
 ) -> type[T]:
     """Create Pydantic model variant with customized defaults.
 
@@ -64,11 +91,15 @@ def create_variant_pydantic_model[T: pydantic.BaseModel](
         discriminator_field: Field to constrain as Literal for tagged unions.
         class_name_suffix: Appended to generated class name.
         module_name: Module path for the generated class.
+        require_all_fields: If True, every field in the base model must be
+            present in defaults (checked recursively for nested models).
 
     Returns:
         New model class with overrides applied.
     """
-    validate_defaults_against_base(defaults, base_class, variant_name)
+    validate_defaults_against_base(
+        defaults, base_class, variant_name, require_all_fields=require_all_fields
+    )
 
     # Sanitize defaults to remove ruamel.yaml metadata
     defaults = sanitize_defaults(defaults)
@@ -106,6 +137,8 @@ def validate_defaults_against_base(
     defaults: dict[str, Any],
     base_class: type[pydantic.BaseModel],
     variant_name: str,
+    *,
+    require_all_fields: bool = False,
 ) -> None:
     """Validate that all fields in defaults exist in the base model.
 
@@ -117,6 +150,10 @@ def validate_defaults_against_base(
         defaults: Field overrides to validate.
         base_class: Base model defining valid fields.
         variant_name: Variant identifier for error messages.
+        require_all_fields: If True, every field in the base model must be
+            present in defaults. Nested Pydantic model fields are checked
+            recursively. Useful for locales where falling back to English
+            defaults is incorrect.
     """
     base_fields = base_class.model_fields
 
@@ -127,6 +164,34 @@ def validate_defaults_against_base(
                 f"is not defined in {base_class.__name__}"
             )
             raise RenderCVInternalError(message)
+
+    if require_all_fields:
+        missing_fields = set(base_fields.keys()) - set(defaults.keys())
+        if missing_fields:
+            message = (
+                f"Missing fields {sorted(missing_fields)} in defaults for"
+                f" '{variant_name}' (base class: {base_class.__name__})"
+            )
+            raise RenderCVInternalError(message)
+
+        # Recursively check nested Pydantic model fields
+        for field_name, default_value in defaults.items():
+            if not isinstance(default_value, dict):
+                continue
+
+            base_field_info = base_fields[field_name]
+            nested_obj = resolve_nested_model(base_field_info)
+
+            if nested_obj is not None:
+                nested_fields = type(nested_obj).model_fields
+                missing_nested = set(nested_fields.keys()) - set(default_value.keys())
+                if missing_nested:
+                    message = (
+                        f"Missing nested fields {sorted(missing_nested)} in"
+                        f" '{field_name}' for '{variant_name}'"
+                        f" (nested class: {type(nested_obj).__name__})"
+                    )
+                    raise RenderCVInternalError(message)
 
 
 def generate_model_name(variant_name: str, class_name_suffix: str) -> str:
@@ -147,8 +212,8 @@ def generate_model_name(variant_name: str, class_name_suffix: str) -> str:
 
 def update_description_with_new_default(
     original_description: str | None,
-    old_default: Any,
-    new_default: Any,
+    old_default: object,
+    new_default: object,
 ) -> str | None:
     """Update field description to reflect new default value.
 
@@ -283,14 +348,9 @@ def create_nested_model_variant_model(
 
         if isinstance(new_value, dict):
             # Check if this field is a nested Pydantic model
-            nested_obj = None
-            if base_field_info.default_factory is not None:
-                factory = cast(Callable[[], Any], base_field_info.default_factory)
-                nested_obj = factory()
-            elif isinstance(base_field_info.default, pydantic.BaseModel):
-                nested_obj = base_field_info.default
+            nested_obj = resolve_nested_model(base_field_info)
 
-            if nested_obj is not None and isinstance(nested_obj, pydantic.BaseModel):
+            if nested_obj is not None:
                 # Recursively create nested field spec
                 field_specs[field_name] = create_nested_field_spec(
                     new_value, base_field_info
@@ -333,17 +393,7 @@ def create_nested_field_spec(
     Returns:
         Tuple of variant class annotation and Field with default_factory.
     """
-    # Get the base nested object - could be from default or default_factory
-    base_nested_obj: pydantic.BaseModel | None = None
-
-    if base_field_info.default_factory is not None:
-        # Create an instance using the factory
-        # Cast to proper callable type to satisfy type checker
-        factory = cast(Callable[[], Any], base_field_info.default_factory)
-        base_nested_obj = cast(pydantic.BaseModel, factory())
-    elif isinstance(base_field_info.default, pydantic.BaseModel):
-        # The default is already a Pydantic model instance
-        base_nested_obj = base_field_info.default
+    base_nested_obj = resolve_nested_model(base_field_info)
 
     if base_nested_obj is not None:
         # Create a variant class with updated field specs and descriptions

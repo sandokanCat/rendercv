@@ -32,6 +32,7 @@ def discover_other_locales() -> list[type[EnglishLocale]]:
             discriminator_field="language",
             class_name_suffix="Locale",
             module_name="rendercv.schema.models.locale",
+            require_all_fields=True,
         )
         discovered.append(locale_model)
 
@@ -40,11 +41,11 @@ def discover_other_locales() -> list[type[EnglishLocale]]:
 
 # Build discriminated union dynamically
 type Locale = Annotated[
-    EnglishLocale | reduce(or_, discover_other_locales()),  # ty: ignore[invalid-type-form]
+    reduce(or_, discover_other_locales(), EnglishLocale),  # ty: ignore[invalid-type-form]
     pydantic.Field(discriminator="language"),
 ]
 available_locales = [
     LocaleModel.model_fields["language"].default
     for LocaleModel in get_args(get_args(Locale.__value__)[0])
 ]
-locale_adapter = pydantic.TypeAdapter(Locale)
+locale_adapter = pydantic.TypeAdapter[Locale](Locale)
